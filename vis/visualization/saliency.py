@@ -243,3 +243,82 @@ def visualize_cam(model, layer_idx, filter_indices,
         (ActivationMaximization(model.layers[layer_idx], filter_indices), -1)
     ]
     return visualize_cam_with_losses(model.input, losses, seed_input, penultimate_layer, grad_modifier)
+
+def get_cam_optimizer(model, layer_idx, filter_indices):
+
+    penultimate_layer = _find_penultimate_layer(model, layer_idx, None)
+    losses = [
+        (ActivationMaximization(model.layers[layer_idx], filter_indices), -1)
+    ]
+    penultimate_output = penultimate_layer.output
+    opt = Optimizer(model.input, losses, wrt_tensor=penultimate_output, norm_grads=False)
+    return opt
+
+def visualize_cam_with_optimizer(model, layer_idx, opt,seed_input):
+    input_tensor = model.input
+    penultimate_layer = _find_penultimate_layer(model, layer_idx, None)
+    penultimate_output = penultimate_layer.output
+
+    _, grads, penultimate_output_value = opt.minimize(seed_input, max_iter=1, grad_modifier=None, verbose=False)
+    #opt.minimize(seed_input, max_iter=1, grad_modifier=grad_modifier, verbose=False)
+
+    # For numerical stability. Very small grad values along with small penultimate_output_value can cause
+    # w * penultimate_output_value to zero out, even for reasonable fp precision of float32.
+    grads = grads / (np.max(grads) + K.epsilon())
+    # Average pooling across all feature maps.
+    # This captures the importance of feature map (channel) idx to the output.
+    channel_idx = 1 if K.image_data_format() == 'channels_first' else -1
+    other_axis = np.delete(np.arange(len(grads.shape)), channel_idx)
+    weights = np.mean(grads, axis=tuple(other_axis))
+
+    # Generate heatmap by computing weight * output over feature maps
+    output_dims = utils.get_img_shape(penultimate_output)[2:]
+    heatmap = np.zeros(shape=output_dims, dtype=K.floatx())
+
+    for i, w in enumerate(weights):
+        if channel_idx == -1:
+            heatmap += w * penultimate_output_value[0, ..., i]
+        else:
+            heatmap += w * penultimate_output_value[0, i, ...]
+
+    # ReLU thresholding to exclude pattern mismatch information (negative gradients).
+    heatmap = np.maximum(heatmap, 0)
+
+    # The penultimate feature map size is definitely smaller than input image.
+    input_dims = utils.get_img_shape(input_tensor)[2:]
+#    heatmap = imresize(heatmap, input_dims, interp='bicubic', mode='F')
+
+#    # Normalize and create heatmap.
+#    heatmap = utils.normalize(heatmap)
+#    return np.uint8(cm.jet(heatmap)[..., :3] * 255)
+
+    # Figure out the zoom factor.
+    zoom_factor = [i / (j * 1.0) for i, j in iter(zip(input_dims, output_dims))]
+    heatmap = zoom(heatmap, zoom_factor)
+    return utils.normalize(heatmap)
+
+def get_saliency_optimizer(model, layer_idx, filter_indices, wrt_tensor=None,
+                       backprop_modifier=None):
+    if backprop_modifier is not None:
+        modifier_fn = get(backprop_modifier)
+        model = modifier_fn(model)
+
+    # `ActivationMaximization` loss reduces as outputs get large, hence negative gradients indicate the direction
+    # for increasing activations. Multiply with -1 so that positive gradients indicate increase instead.
+    losses = [
+        (ActivationMaximization(model.layers[layer_idx], filter_indices), -1)
+    ]
+
+    input_tensor = model.input
+    opt = Optimizer(input_tensor, losses, wrt_tensor=wrt_tensor, norm_grads=False)
+    return(opt)
+
+def visualize_saliency_with_optimizer(model, layer_idx, opt, seed_input, wrt_tensor=None,
+                       backprop_modifier=None, grad_modifier='absolute', keepdims=False):
+
+    grads = opt.minimize(seed_input=seed_input, max_iter=1, grad_modifier=grad_modifier, verbose=False)[1]
+
+    if not keepdims:
+        channel_idx = 1 if K.image_data_format() == 'channels_first' else -1
+        grads = np.max(grads, axis=channel_idx)
+    return utils.normalize(grads)[0]
